@@ -25,7 +25,12 @@ import (
 
 	configv1 "github.com/openshift/api/config/v1"
 	libgocrypto "github.com/openshift/library-go/pkg/crypto"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 const (
@@ -46,15 +51,15 @@ var (
 // FetchAPIServerTLSProfile fetches the TLS profile spec configured in APIServer.
 // If no profile is configured, the default profile is returned.
 func FetchAPIServerTLSProfile(ctx context.Context, k8sClient client.Client) (configv1.TLSProfileSpec, error) {
-	apiServer := &configv1.APIServer{}
-	key := client.ObjectKey{Name: APIServerName}
-
-	if err := k8sClient.Get(ctx, key, apiServer); err != nil {
+	apiServer, err := fetchAPIServer(ctx, k8sClient)
+	if err != nil {
+		key := client.ObjectKey{Name: APIServerName}
 		return configv1.TLSProfileSpec{}, fmt.Errorf("failed to get APIServer %q: %w", key.String(), err)
 	}
 
 	profile, err := GetTLSProfileSpec(apiServer.Spec.TLSSecurityProfile)
 	if err != nil {
+		key := client.ObjectKey{Name: APIServerName}
 		return configv1.TLSProfileSpec{}, fmt.Errorf("failed to get TLS profile from APIServer %q: %w", key.String(), err)
 	}
 
@@ -64,14 +69,23 @@ func FetchAPIServerTLSProfile(ctx context.Context, k8sClient client.Client) (con
 // FetchAPIServerTLSAdherencePolicy fetches the TLS adherence policy configured in APIServer.
 // If no policy is configured, the default policy is returned.
 func FetchAPIServerTLSAdherencePolicy(ctx context.Context, k8sClient client.Client) (configv1.TLSAdherencePolicy, error) {
-	apiServer := &configv1.APIServer{}
-	key := client.ObjectKey{Name: APIServerName}
-
-	if err := k8sClient.Get(ctx, key, apiServer); err != nil {
+	apiServer, err := fetchAPIServer(ctx, k8sClient)
+	if err != nil {
+		key := client.ObjectKey{Name: APIServerName}
 		return configv1.TLSAdherencePolicyNoOpinion, fmt.Errorf("failed to get APIServer %q: %w", key.String(), err)
 	}
 
 	return apiServer.Spec.TLSAdherence, nil
+}
+
+func fetchAPIServer(ctx context.Context, k8sClient client.Client) (*configv1.APIServer, error) {
+	apiServer := &configv1.APIServer{}
+
+	if err := k8sClient.Get(ctx, client.ObjectKey{Name: APIServerName}, apiServer); err != nil {
+		return nil, err
+	}
+
+	return apiServer, nil
 }
 
 // GetTLSProfileSpec returns TLSProfileSpec for the given profile.
@@ -104,6 +118,125 @@ func GetTLSProfileSpec(profile *configv1.TLSSecurityProfile) (configv1.TLSProfil
 
 	// Return the custom profile spec.
 	return profile.Custom.TLSProfileSpec, nil
+}
+
+// ConfigResult holds the results of ResolveTLSConfig.
+type ConfigResult struct {
+	// TLSConfig is a function that configures a tls.Config based on the resolved profile.
+	TLSConfig func(*tls.Config)
+
+	// ProfileSpec is the profile specification observed in APIServer. It remains
+	// unchanged when TLSConfig uses the default because the observed profile is
+	// also used to initialize SecurityProfileWatcher.
+	ProfileSpec configv1.TLSProfileSpec
+
+	// AdherencePolicy is the resolved TLS adherence policy.
+	AdherencePolicy configv1.TLSAdherencePolicy
+
+	// APIServerAvailable reports whether the APIServer API is available for a
+	// SecurityProfileWatcher. It is false when the API is absent, and true when
+	// the resource was read, is temporarily absent, or a transient read error occurred.
+	APIServerAvailable bool
+}
+
+// ResolveTLSConfig resolves TLS configuration for an operator.
+// It fetches the cluster TLS profile and adherence policy, applies the appropriate
+// configuration, and returns a ConfigResult that can be used with the SecurityProfileWatcher.
+//
+// If the OpenShift API is absent or temporarily unavailable, this function falls back to
+// default configurations. Permission and unexpected API errors are returned to the caller.
+func ResolveTLSConfig(ctx context.Context, restConfig *rest.Config) (*ConfigResult, error) {
+	// The default controller-runtime scheme does not include OpenShift API types.
+	scheme := runtime.NewScheme()
+	if err := configv1.AddToScheme(scheme); err != nil {
+		return nil, fmt.Errorf("failed to add OpenShift config API to scheme: %w", err)
+	}
+
+	kubeClient, err := client.New(restConfig, client.Options{Scheme: scheme})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create kubernetes client: %w", err)
+	}
+
+	return resolveTLSConfig(ctx, kubeClient)
+}
+
+func resolveTLSConfig(ctx context.Context, kubeClient client.Client) (*ConfigResult, error) {
+	logger := log.FromContext(ctx)
+
+	defaultProfile := *configv1.TLSProfiles[configv1.TLSProfileIntermediateType]
+	profileSpec := defaultProfile
+
+	// Read the APIServer resource once so the profile and adherence policy come from
+	// the same resource version.
+	adherencePolicy := configv1.TLSAdherencePolicyNoOpinion
+	apiServerAvailable := true
+	apiServer, fetchErr := fetchAPIServer(ctx, kubeClient)
+	if fetchErr != nil {
+		shouldFallback, available := classifyAPIServerFetchError(fetchErr)
+		if !shouldFallback {
+			key := client.ObjectKey{Name: APIServerName}
+			return nil, fmt.Errorf("failed to get APIServer %q: %w", key.String(), fetchErr)
+		}
+
+		apiServerAvailable = available
+		logger.Info("APIServer TLS configuration unavailable, using default TLS settings")
+	} else {
+		adherencePolicy = apiServer.Spec.TLSAdherence
+		fetchedProfile, profileErr := GetTLSProfileSpec(apiServer.Spec.TLSSecurityProfile)
+		if profileErr != nil {
+			logger.Info("APIServer TLS profile is invalid, using the default profile")
+		} else {
+			profileSpec = fetchedProfile
+		}
+	}
+
+	// NoOpinion and LegacyAdheringComponentsOnly preserve the legacy behavior of
+	// using the component default. Unknown values honor the cluster profile for
+	// forward-compatible, more secure behavior, matching library-go's helper.
+	profileToApply := defaultProfile
+	if adherencePolicy != configv1.TLSAdherencePolicyNoOpinion &&
+		adherencePolicy != configv1.TLSAdherencePolicyLegacyAdheringComponentsOnly {
+		// The cluster profile is authoritative when strict adherence is requested.
+		profileToApply = profileSpec
+	}
+
+	// NewTLSConfigFromProfile uses TLSVersionOrDie, so only reject an invalid
+	// version that would otherwise panic. Valid legacy versions remain supported.
+	if _, err := libgocrypto.TLSVersion(string(profileToApply.MinTLSVersion)); err != nil {
+		logger.Info("APIServer TLS profile has an invalid minimum TLS version, using the default profile")
+		profileToApply = defaultProfile
+	}
+
+	tlsConfigFn, unsupportedCiphers := NewTLSConfigFromProfile(profileToApply)
+	if len(unsupportedCiphers) > 0 {
+		logger.Info("TLS profile contains unsupported ciphers that will be ignored", "count", len(unsupportedCiphers))
+	}
+
+	return &ConfigResult{
+		TLSConfig:          tlsConfigFn,
+		ProfileSpec:        profileSpec,
+		AdherencePolicy:    adherencePolicy,
+		APIServerAvailable: apiServerAvailable,
+	}, nil
+}
+
+func classifyAPIServerFetchError(err error) (shouldFallback, apiServerAvailable bool) {
+	if meta.IsNoMatchError(err) {
+		return true, false
+	}
+	if apierrors.IsNotFound(err) {
+		return true, true
+	}
+
+	if apierrors.IsServiceUnavailable(err) ||
+		apierrors.IsTimeout(err) ||
+		apierrors.IsServerTimeout(err) ||
+		apierrors.IsTooManyRequests(err) ||
+		errors.Is(err, context.DeadlineExceeded) {
+		return true, true
+	}
+
+	return false, false
 }
 
 // NewTLSConfigFromProfile returns a function that configures a tls.Config based on the provided TLSProfileSpec,
