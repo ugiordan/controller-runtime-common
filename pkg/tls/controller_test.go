@@ -18,15 +18,24 @@ package tls
 
 import (
 	"context"
+	"errors"
 	"sync"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	configv1 "github.com/openshift/api/config/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 )
+
+// The fake clients used by the direct Reconcile tests share the suite's
+// testScheme, which already has configv1 installed.
 
 // atomicSlice provides thread-safe slice operations.
 type atomicSlice[T any] struct {
@@ -367,6 +376,70 @@ var _ = Describe("SecurityProfileWatcher controller", func() {
 			change := adherencePolicyChanges.Index(0)
 			Expect(change.old).To(Equal(configv1.TLSAdherencePolicyNoOpinion), "callback should receive the initial policy as old")
 			Expect(change.new).To(Equal(configv1.TLSAdherencePolicyStrictAllComponents), "callback should receive the current policy as new")
+		})
+	})
+
+	Context("when the APIServer read fails", func() {
+		type readErrorCase struct {
+			readErr          error
+			expectRetryError bool
+		}
+
+		DescribeTable("handling read errors with a fatal callback set",
+			func(c readErrorCase) {
+				fatalCalls := &atomicSlice[error]{}
+				watcher := &SecurityProfileWatcher{
+					Client: fake.NewClientBuilder().WithScheme(testScheme).WithInterceptorFuncs(interceptor.Funcs{
+						Get: func(_ context.Context, _ client.WithWatch, _ client.ObjectKey, _ client.Object, _ ...client.GetOption) error {
+							return c.readErr
+						},
+					}).Build(),
+					OnFatalReadError: func(_ context.Context, readErr error) {
+						fatalCalls.Append(readErr)
+					},
+				}
+
+				_, err := watcher.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKey{Name: APIServerName}})
+
+				if c.expectRetryError {
+					Expect(err).To(HaveOccurred(), "non-authorization errors must stay retryable")
+					Expect(fatalCalls.Len()).To(Equal(0), "fatal callback must not run for retryable errors")
+					return
+				}
+				Expect(err).NotTo(HaveOccurred(), "authorization errors with a fatal callback must not be retried")
+				Expect(fatalCalls.Len()).To(Equal(1), "fatal callback must run exactly once")
+				Expect(fatalCalls.Index(0)).To(MatchError(c.readErr))
+			},
+			Entry("forbidden invokes the fatal callback", readErrorCase{
+				readErr: apierrors.NewForbidden(
+					schema.GroupResource{Group: "config.openshift.io", Resource: "apiservers"}, "cluster", errors.New("denied")),
+			}),
+			Entry("unauthorized invokes the fatal callback", readErrorCase{
+				readErr: apierrors.NewUnauthorized("denied"),
+			}),
+			Entry("server timeout stays retryable", readErrorCase{
+				readErr: apierrors.NewServerTimeout(
+					schema.GroupResource{Group: "config.openshift.io", Resource: "apiservers"}, "get", 1),
+				expectRetryError: true,
+			}),
+			Entry("service unavailable stays retryable", readErrorCase{
+				readErr:          apierrors.NewServiceUnavailable("temporarily unavailable"),
+				expectRetryError: true,
+			}),
+		)
+
+		It("should keep returning authorization errors for retry when no fatal callback is set", func() {
+			watcher := &SecurityProfileWatcher{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithInterceptorFuncs(interceptor.Funcs{
+					Get: func(_ context.Context, _ client.WithWatch, _ client.ObjectKey, _ client.Object, _ ...client.GetOption) error {
+						return apierrors.NewForbidden(
+							schema.GroupResource{Group: "config.openshift.io", Resource: "apiservers"}, "cluster", errors.New("denied"))
+					},
+				}).Build(),
+			}
+
+			_, err := watcher.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKey{Name: APIServerName}})
+			Expect(err).To(HaveOccurred(), "default behavior without a callback is retry")
 		})
 	})
 })

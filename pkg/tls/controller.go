@@ -74,6 +74,16 @@ type SecurityProfileWatcher struct {
 
 	// OnAdherencePolicyChange is a function that will be called when the TLS adherence policy changes.
 	OnAdherencePolicyChange func(ctx context.Context, oldTLSAdherencePolicy, newTLSAdherencePolicy configv1.TLSAdherencePolicy)
+
+	// OnFatalReadError is invoked when the APIServer read fails with an
+	// authorization error (401 Unauthorized or 403 Forbidden). Authorization
+	// loss means the component can no longer observe the cluster TLS policy,
+	// and retrying while continuing to serve the last known configuration
+	// would silently violate adherence. When set, such errors invoke this
+	// callback instead of being returned for a retry; the typical callback
+	// cancels the manager context to stop serving. All other read errors keep
+	// the default retry behavior.
+	OnFatalReadError func(ctx context.Context, readErr error)
 }
 
 // SetupWithManager sets up the controller with the Manager.
@@ -128,6 +138,12 @@ func (r *SecurityProfileWatcher) Reconcile(ctx context.Context, req ctrl.Request
 			return ctrl.Result{}, nil
 		}
 
+		if r.OnFatalReadError != nil && isAuthorizationError(err) {
+			logger.Info("APIServer read failed with an authorization error, invoking the fatal read callback", "error", err)
+			r.OnFatalReadError(ctx, err)
+			return ctrl.Result{}, nil
+		}
+
 		return ctrl.Result{}, fmt.Errorf("failed to get APIServer %s: %w", req.NamespacedName.String(), err)
 	}
 
@@ -161,4 +177,11 @@ func (r *SecurityProfileWatcher) Reconcile(ctx context.Context, req ctrl.Request
 
 	// No need to requeue, as the callback will handle further actions.
 	return ctrl.Result{}, nil
+}
+
+// isAuthorizationError reports whether err is an authorization failure
+// (401 Unauthorized or 403 Forbidden), which the watcher cannot recover
+// from by retrying.
+func isAuthorizationError(err error) bool {
+	return apierrors.IsForbidden(err) || apierrors.IsUnauthorized(err)
 }
